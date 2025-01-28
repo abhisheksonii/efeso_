@@ -53,18 +53,20 @@ def initialize_claude_client():
 
 
 def process_production_data(df: pd.DataFrame, client=None) -> List[Dict[str, Any]]:
-    """Process production data with optional Claude integration"""
+    """Process production data with validation and calculations"""
     sections = []
     current_stream = None
     current_section = {}
     
     for idx, row in df.iterrows():
+        # Skip empty rows
         if pd.isna(row['Line']) or str(row['Line']).strip() == '':
             continue
             
         process_name = str(row['Asset / Area']).strip()
         line = str(row['Line']).strip()
         
+        # New section detection
         if 'Production Stream' in line or 'SRA' in line:
             if current_section:
                 sections.append(current_section)
@@ -76,49 +78,103 @@ def process_production_data(df: pd.DataFrame, client=None) -> List[Dict[str, Any
             
         if process_name and process_name not in ['Process', 'Total Tonnes', 'Despatch']:
             try:
-                # Calculate Value Adding Hours
+                # Validate required fields
+                required_fields = ['Nameplate Speed', 'Average Speed (UoM/hr)', 'Production Volume', 
+                                 'Number of Machines', 'Standard Manning Days', 'Machine Hours per Week']
+                for field in required_fields:
+                    if pd.isna(row[field]):
+                        logger.warning(f"Missing required field {field} for process {process_name}")
+                        continue
+
+                # Calculate reference speed
                 ref_speed = float(row['Nameplate Speed']) if not pd.isna(row['Nameplate Speed']) else float(row['Average Speed (UoM/hr)'])
-                value_adding_hours = (float(row['Production Volume']) / (ref_speed * 60) / float(row['Number of Machines'])) if ref_speed > 0 else 0
                 
-                # Calculate Dir op/mach/shift
+                # Calculate value adding hours with validation
+                value_adding_hours = 0
+                if ref_speed > 0 and float(row['Number of Machines']) > 0:
+                    value_adding_hours = (float(row['Production Volume']) / (ref_speed * 60) / float(row['Number of Machines']))
+                
+                # Calculate direct operators per machine/shift
                 dir_op = (float(row['Standard Manning Days']) / float(row['Number of Machines'])) if not pd.isna(row['Standard Manning Days']) else 0
                 
-                # Calculate Required Manhours
+                # Calculate machine hours and required manhours
                 machine_hours = float(row['Machine Hours per Week']) if not pd.isna(row['Machine Hours per Week']) else 0
                 required_manhours = dir_op * machine_hours * float(row['Number of Machines'])
                 
-                # Calculate Saturation
-                saturation = (machine_hours / 168) if machine_hours > 0 else 0
+                # Calculate saturation with validation
+                saturation = min((machine_hours / 168), 1) if machine_hours > 0 else 0
+                
+                # Calculate OEE dynamically if possible
+                try:
+                    theoretical_output = ref_speed * machine_hours * 60
+                    actual_output = float(row['Production Volume'])
+                    oee = actual_output / theoretical_output if theoretical_output > 0 else 0.57
+                    oee = min(max(oee, 0), 1)  # Ensure OEE is between 0 and 1
+                except:
+                    oee = 0.57  # Default value if calculation fails
                 
                 process_data = {
                     'name': process_name,
                     'machines': int(row['Number of Machines']),
                     'volume': float(row['Production Volume']),
                     'unit': str(row['UoM']),
-                    'value_adding_hours': value_adding_hours,
-                    'ref_speed': ref_speed,
-                    'oee': 0.57,  # Fixed at 57% as per image
-                    'actual_hours': machine_hours,
-                    'saturation': saturation,
-                    'operators_per_machine': dir_op,
-                    'required_manhours': required_manhours,
-                    'actual_manhours': 0,  # Left empty as requested
-                    'org_losses': 0,  # Left empty as requested
-                    'actual_ops': 0   # Left empty as requested
+                    'value_adding_hours': round(value_adding_hours, 2),
+                    'ref_speed': round(ref_speed, 2),
+                    'oee': round(oee, 2),
+                    'actual_hours': round(machine_hours, 2),
+                    'saturation': round(saturation, 2),
+                    'operators_per_machine': round(dir_op, 2),
+                    'required_manhours': round(required_manhours, 2),
+                    'actual_manhours': calculate_actual_manhours(row),
+                    'org_losses': calculate_organizational_losses(row),
+                    'actual_ops': calculate_actual_operators(row)
                 }
                 
                 if current_section:
                     current_section['processes'].append(process_data)
                 
             except Exception as e:
-                logger.warning(f"Error processing row {idx}: {str(e)}")
+                logger.warning(f"Error processing row {idx} - {process_name}: {str(e)}")
                 continue
     
+    # Add final section if exists
     if current_section:
         sections.append(current_section)
         
     return sections
-    
+def calculate_actual_manhours(row: pd.Series) -> float:
+    """Calculate actual manhours based on available data"""
+    try:
+        if not pd.isna(row.get('Actual Manhours')):
+            return float(row['Actual Manhours'])
+        elif not pd.isna(row.get('Standard Manning Days')) and not pd.isna(row.get('Machine Hours per Week')):
+            return float(row['Standard Manning Days']) * float(row['Machine Hours per Week'])
+        return 0
+    except:
+        return 0  
+def calculate_organizational_losses(row: pd.Series) -> float:
+    """Calculate organizational losses based on available data"""
+    try:
+        if not pd.isna(row.get('Organizational Losses')):
+            return float(row['Organizational Losses'])
+        actual_hours = calculate_actual_manhours(row)
+        required_hours = float(row['Standard Manning Days']) * float(row['Machine Hours per Week'])
+        if required_hours > 0:
+            return max(0, (actual_hours - required_hours) / actual_hours)
+        return 0
+    except:
+        return 0
+
+def calculate_actual_operators(row: pd.Series) -> int:
+    """Calculate actual number of operators based on available data"""
+    try:
+        if not pd.isna(row.get('Actual Operators')):
+            return int(row['Actual Operators'])
+        elif not pd.isna(row.get('Standard Manning Days')):
+            return int(round(float(row['Standard Manning Days'])))
+        return 0
+    except:
+        return 0  
 def handle_file_processing(file):
     """Process a single file and return the report data"""
     try:
@@ -174,90 +230,112 @@ def get_claude_analysis(client, df_json: str) -> Dict:
         return {}
     
 def transform_to_capacity_report(sections: List[Dict[str, Any]]) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Transform processed data into capacity report format with proper column names"""
+    """Transform processed data into capacity and labour reports with calculations"""
+    if not sections:
+        raise ValueError("No valid sections to process")
+        
     capacity_data = []
     labour_data = []
     
-    # Define column names explicitly
-    capacity_columns = {
-        'Process': 'Process',
-        '# Mach. Avail.': '# Mach. Avail.',
-        'Production Volume (Weekly)': 'Production Volume (Weekly)',
-        'Meas. Unit': 'Meas. Unit',
-        'Value Adding Mc Hours/Week/Mc': 'Value Adding Mc Hours/Week/Mc',
-        'Ref Speed (Meas. Unit per min)': 'Ref Speed (Meas. Unit per min)',
-        'Actual OEE': 'Actual OEE',
-        'Actual Mc Hours/Week/Mc': 'Actual Mc Hours/Week/Mc',
-        'Saturation vs. 168': 'Saturation vs. 168'
-    }
-    
-    labour_columns = {
-        'Dir op/mach/shift': 'Dir op/mach/shift',
-        'Required Manhours/Week': 'Required Manhours/Week',
-        'Actual Manhour/Week': 'Actual Manhour/Week',
-        'Org. Losses': 'Org. Losses',
-        'Actual No of Dir. Ops': 'Actual No of Dir. Ops',
-        'Target Prod': 'Target Prod',
-        'Actual Efficiency': 'Actual Efficiency'
-    }
-    
     for section in sections:
         for process in section['processes']:
+            # Validate process data
+            if not all(key in process for key in ['name', 'machines', 'volume', 'unit', 'value_adding_hours',
+                                                'ref_speed', 'oee', 'actual_hours', 'saturation']):
+                logger.warning(f"Skipping incomplete process data: {process.get('name', 'Unknown')}")
+                continue
+                
+            # Create capacity row with validated data
             capacity_row = {
-                capacity_columns['Process']: process['name'],
-                capacity_columns['# Mach. Avail.']: process['machines'],
-                capacity_columns['Production Volume (Weekly)']: process['volume'],
-                capacity_columns['Meas. Unit']: process['unit'],
-                capacity_columns['Value Adding Mc Hours/Week/Mc']: process['value_adding_hours'],
-                capacity_columns['Ref Speed (Meas. Unit per min)']: process['ref_speed'],
-                capacity_columns['Actual OEE']: process['oee'],
-                capacity_columns['Actual Mc Hours/Week/Mc']: process['actual_hours'],
-                capacity_columns['Saturation vs. 168']: process['saturation']
+                'Process': process['name'],
+                '# Mach. Avail.': process['machines'],
+                'Production Volume (Weekly)': process['volume'],
+                'Meas. Unit': process['unit'],
+                'Value Adding Mc Hours/Week/Mc': process['value_adding_hours'],
+                'Ref Speed (Meas. Unit per min)': process['ref_speed'],
+                'Actual OEE': process['oee'],
+                'Actual Mc Hours/Week/Mc': process['actual_hours'],
+                'Saturation vs. 168': process['saturation']
             }
             
+            # Create labour row with validated data
             labour_row = {
-                labour_columns['Dir op/mach/shift']: process['operators_per_machine'],
-                labour_columns['Required Manhours/Week']: process['required_manhours'],
-                labour_columns['Actual Manhour/Week']: process['actual_manhours'],
-                labour_columns['Org. Losses']: 0,
-                labour_columns['Actual No of Dir. Ops']: 0,
-                labour_columns['Target Prod']: '',
-                labour_columns['Actual Efficiency']: ''
+                'Dir op/mach/shift': process['operators_per_machine'],
+                'Required Manhours/Week': process['required_manhours'],
+                'Actual Manhour/Week': process['actual_manhours'],
+                'Org. Losses': process['org_losses'],
+                'Actual No of Dir. Ops': process['actual_ops'],
+                'Target Prod': calculate_target_productivity(process),
+                'Actual Efficiency': calculate_actual_efficiency(process)
             }
             
             capacity_data.append(capacity_row)
             labour_data.append(labour_row)
     
-    # Calculate totals
-    total_machines = sum(p['machines'] for s in sections for p in s['processes'])
-    total_volume = sum(p['volume'] for s in sections for p in s['processes'])
-    avg_oee = np.mean([p['oee'] for s in sections for p in s['processes']])
-    avg_hours = np.mean([p['actual_hours'] for s in sections for p in s['processes']])
-    
-    # Add totals row with proper column mapping
-    capacity_data.append({
-        capacity_columns['Process']: 'Total',
-        capacity_columns['# Mach. Avail.']: total_machines,
-        capacity_columns['Production Volume (Weekly)']: total_volume,
-        capacity_columns['Meas. Unit']: '',
-        capacity_columns['Value Adding Mc Hours/Week/Mc']: '',
-        capacity_columns['Ref Speed (Meas. Unit per min)']: '',
-        capacity_columns['Actual OEE']: avg_oee,
-        capacity_columns['Actual Mc Hours/Week/Mc']: avg_hours,
-        capacity_columns['Saturation vs. 168']: 0.54
-    })
-    
-    labour_data.append({
-        labour_columns['Dir op/mach/shift']: 0,
-        labour_columns['Required Manhours/Week']: 14297,
-        labour_columns['Actual Manhour/Week']: 18659,
-        labour_columns['Org. Losses']: 0.31,
-        labour_columns['Actual No of Dir. Ops']: 415,
-        labour_columns['Target Prod']: '',
-        labour_columns['Actual Efficiency']: ''
-    })
+    # Calculate and add totals
+    if capacity_data:
+        total_row_capacity = calculate_totals(capacity_data)
+        total_row_labour = calculate_labour_totals(labour_data)
+        
+        capacity_data.append(total_row_capacity)
+        labour_data.append(total_row_labour)
     
     return pd.DataFrame(capacity_data), pd.DataFrame(labour_data)
+def calculate_target_productivity(process: Dict[str, Any]) -> float:
+    """Calculate target productivity based on process data"""
+    try:
+        if process['actual_hours'] > 0 and process['operators_per_machine'] > 0:
+            return process['volume'] / (process['actual_hours'] * process['operators_per_machine'])
+        return 0
+    except:
+        return 0
+
+def calculate_actual_efficiency(process: Dict[str, Any]) -> float:
+    """Calculate actual efficiency based on process data"""
+    try:
+        target_prod = calculate_target_productivity(process)
+        if target_prod > 0:
+            return process['volume'] / (process['actual_manhours'] / process['machines'])
+        return 0
+    except:
+        return 0
+
+def calculate_totals(capacity_data: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Calculate totals for capacity data"""
+    total_machines = sum(row['# Mach. Avail.'] for row in capacity_data)
+    total_volume = sum(row['Production Volume (Weekly)'] for row in capacity_data)
+    avg_oee = np.mean([row['Actual OEE'] for row in capacity_data])
+    avg_hours = np.mean([row['Actual Mc Hours/Week/Mc'] for row in capacity_data])
+    avg_saturation = np.mean([row['Saturation vs. 168'] for row in capacity_data])
+    
+    return {
+        'Process': 'Total',
+        '# Mach. Avail.': total_machines,
+        'Production Volume (Weekly)': total_volume,
+        'Meas. Unit': '',
+        'Value Adding Mc Hours/Week/Mc': '',
+        'Ref Speed (Meas. Unit per min)': '',
+        'Actual OEE': avg_oee,
+        'Actual Mc Hours/Week/Mc': avg_hours,
+        'Saturation vs. 168': avg_saturation
+    }
+
+def calculate_labour_totals(labour_data: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Calculate totals for labour data"""
+    total_required = sum(row['Required Manhours/Week'] for row in labour_data)
+    total_actual = sum(row['Actual Manhour/Week'] for row in labour_data)
+    total_ops = sum(row['Actual No of Dir. Ops'] for row in labour_data)
+    avg_losses = np.mean([row['Org. Losses'] for row in labour_data if row['Org. Losses'] > 0])
+    
+    return {
+        'Dir op/mach/shift': '',
+        'Required Manhours/Week': total_required,
+        'Actual Manhour/Week': total_actual,
+        'Org. Losses': avg_losses,
+        'Actual No of Dir. Ops': total_ops,
+        'Target Prod': '',
+        'Actual Efficiency': ''
+    }
 
 def export_capacity_report(capacity_df: pd.DataFrame, labour_df: pd.DataFrame, file_date: str = None) -> bytes:
     """Export capacity report in EFESO template format with proper headers"""
